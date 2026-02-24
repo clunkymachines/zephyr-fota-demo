@@ -1,0 +1,20 @@
+/*
+ * Board-specific devicetree overrides for FRDM-MCXN947 CPU0.
+ * Keep board-specific changes in this file and generic logic in source code.
+ */
+
+&enet {
+	status = "okay";
+};
+
+&enet_mac {
+	status = "okay";
+};
+
+&enet_mdio {
+	status = "okay";
+};
+
+&phy {
+	status = "okay";
+};
