@@ -8,6 +8,7 @@
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/sys/util.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/http/client.h>
 #include <zephyr/net/net_if.h>
@@ -15,21 +16,39 @@
 #include <zephyr/net/ethernet_mgmt.h>
 #include <zephyr/net/net_event.h>
 #include <zephyr/net/net_mgmt.h>
+#include <zephyr/net/mqtt.h>
 #include <zephyr/dfu/flash_img.h>
 #include <zephyr/dfu/mcuboot.h>
+#include <zcbor_decode.h>
+#include <zcbor_encode.h>
 #include <errno.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define LED0_NODE DT_ALIAS(led0)
-#define BLINK_PERIOD K_MSEC(1000) // HERE
-#define UPDATE_POLL_PERIOD K_SECONDS(10)
-#define UPDATE_THREAD_STACK_SIZE 4096
-#define UPDATE_THREAD_PRIORITY 7
+#define BLINK_PERIOD K_MSEC(100)
 
-#define UPDATE_HOST "vrm.free.fr"
-#define UPDATE_PORT "80"
-#define UPDATE_PATH "/demo.bin"
+#define FOTA_THREAD_STACK_SIZE 4096
+#define FOTA_THREAD_PRIORITY 7
+
+#define MQTT_THREAD_STACK_SIZE 4608
+#define MQTT_THREAD_PRIORITY 7
+#define MQTT_BUFFER_SIZE 1024
+#define MQTT_BROKER_ADDR "10.42.0.1"
+#define MQTT_BROKER_PORT 1883
+#define MQTT_CLIENT_ID "demo001"
+#define MQTT_TOPIC_TASK "device/demo001/task"
+#define MQTT_TOPIC_DATA "device/demo001/data"
+#define MQTT_RECONNECT_DELAY K_SECONDS(2)
+#define MQTT_SERVICE_IDLE_SLICE_MS 1000
+#define MQTT_CONNECT_TIMEOUT_MS 5000
+#define MQTT_PUBLISH_PERIOD_MS 5000
+#define MQTT_TASK_PAYLOAD_BUF_SIZE 320
+#define MQTT_DATA_PAYLOAD_BUF_SIZE 64
+
+#define FOTA_URL_MAX_LEN 256
+#define HTTP_DEFAULT_PORT "80"
 #define UPDATE_HTTP_TIMEOUT_MS 10000
 #define UPDATE_RECV_BUF_SIZE 1024
 
@@ -40,15 +59,32 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define NET_ETH_EVENT_MASK (NET_EVENT_ETHERNET_CARRIER_ON | NET_EVENT_ETHERNET_CARRIER_OFF)
 
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+
 static struct net_mgmt_event_callback net_if_cb;
 static struct net_mgmt_event_callback net_ipv4_cb;
 static struct net_mgmt_event_callback net_eth_cb;
 static struct net_if *target_iface;
+
 static atomic_t net_ready;
 static atomic_t image_confirmed;
 static atomic_t update_pending;
-static atomic_t polling_started;
-static atomic_t waiting_for_ipv4_logged;
+static atomic_t mqtt_connected;
+static atomic_t mqtt_subscribed;
+static atomic_t mqtt_waiting_for_ipv4_logged;
+static atomic_t fota_pending;
+static atomic_t fota_ongoing;
+
+static struct mqtt_client mqtt_client_ctx;
+static struct sockaddr_storage mqtt_broker;
+static struct zsock_pollfd mqtt_fds[1];
+static int mqtt_nfds;
+static uint8_t mqtt_rx_buffer[MQTT_BUFFER_SIZE];
+static uint8_t mqtt_tx_buffer[MQTT_BUFFER_SIZE];
+static uint16_t mqtt_message_id = 1;
+
+K_SEM_DEFINE(fota_request_sem, 0, 1);
+K_MUTEX_DEFINE(fota_url_mutex);
+static char pending_fota_url[FOTA_URL_MAX_LEN + 1];
 
 struct update_download_context {
 	struct flash_img_context flash_ctx;
@@ -59,6 +95,19 @@ struct update_download_context {
 	bool flash_initialized;
 	bool download_failed;
 	bool final_received;
+};
+
+struct parsed_http_url {
+	char host[128];
+	char port[6];
+	char path[FOTA_URL_MAX_LEN + 1];
+};
+
+struct mqtt_task_message {
+	char task[32];
+	char param[FOTA_URL_MAX_LEN + 1];
+	bool has_task;
+	bool has_param;
 };
 
 static bool is_target_iface(struct net_if *iface)
@@ -172,7 +221,7 @@ static void confirm_running_image_once(void)
 		atomic_set(&image_confirmed, 1);
 		if (atomic_get(&update_pending) && mcuboot_swap_type() == BOOT_SWAP_TYPE_NONE) {
 			atomic_set(&update_pending, 0);
-			LOG_INF("No MCUboot swap pending anymore; HTTP polling resumed");
+			LOG_INF("No MCUboot swap pending anymore");
 		}
 		LOG_INF("Current image already confirmed");
 		return;
@@ -188,9 +237,7 @@ static void confirm_running_image_once(void)
 	}
 
 	atomic_set(&image_confirmed, 1);
-	/* Once this image is confirmed, MCUboot should not keep it in pending/revert path. */
 	atomic_set(&update_pending, 0);
-	LOG_INF("HTTP polling resumed after image confirmation");
 	LOG_INF("Running image marked as tested/confirmed");
 }
 
@@ -325,28 +372,99 @@ static bool is_upgrade_already_pending(void)
 	return true;
 }
 
-static int poll_update_url_once(void)
+static int parse_http_url(const char *url, struct parsed_http_url *parsed)
+{
+	const char *prefix = "http://";
+	const char *rest;
+	const char *slash;
+	size_t hostport_len;
+	char hostport[sizeof(parsed->host) + sizeof(parsed->port) + 2];
+	char *port_sep;
+
+	if (url == NULL || parsed == NULL) {
+		return -EINVAL;
+	}
+
+	if (strncmp(url, prefix, strlen(prefix)) != 0) {
+		return -EINVAL;
+	}
+
+	rest = url + strlen(prefix);
+	slash = strchr(rest, '/');
+	hostport_len = slash ? (size_t)(slash - rest) : strlen(rest);
+	if (hostport_len == 0 || hostport_len >= sizeof(hostport)) {
+		return -EINVAL;
+	}
+
+	memcpy(hostport, rest, hostport_len);
+	hostport[hostport_len] = '\0';
+	port_sep = strrchr(hostport, ':');
+
+	if (port_sep != NULL) {
+		size_t host_len = (size_t)(port_sep - hostport);
+		size_t port_len = strlen(port_sep + 1);
+
+		if (host_len == 0 || host_len >= sizeof(parsed->host)) {
+			return -EINVAL;
+		}
+		if (port_len == 0 || port_len >= sizeof(parsed->port)) {
+			return -EINVAL;
+		}
+
+		memcpy(parsed->host, hostport, host_len);
+		parsed->host[host_len] = '\0';
+		strcpy(parsed->port, port_sep + 1);
+	} else {
+		if (hostport_len >= sizeof(parsed->host)) {
+			return -EINVAL;
+		}
+		strcpy(parsed->host, hostport);
+		strcpy(parsed->port, HTTP_DEFAULT_PORT);
+	}
+
+	if (slash == NULL) {
+		strcpy(parsed->path, "/");
+	} else {
+		size_t path_len = strlen(slash);
+
+		if (path_len == 0 || path_len >= sizeof(parsed->path)) {
+			return -EINVAL;
+		}
+		strcpy(parsed->path, slash);
+	}
+
+	return 0;
+}
+
+static int download_update_from_url(const char *url)
 {
 	static const char *headers[] = {
 		"Connection: close\r\n",
 		NULL,
 	};
 	uint8_t recv_buf[UPDATE_RECV_BUF_SIZE];
+	struct parsed_http_url parsed = {0};
 	struct update_download_context dl_ctx = {0};
 	struct http_request req = {0};
 	int sock;
 	int ret;
 
-	sock = connect_http_socket(UPDATE_HOST, UPDATE_PORT);
+	ret = parse_http_url(url, &parsed);
+	if (ret < 0) {
+		LOG_ERR("Invalid FOTA URL: %s", url);
+		return ret;
+	}
+
+	sock = connect_http_socket(parsed.host, parsed.port);
 	if (sock < 0) {
 		return sock;
 	}
 
-	LOG_INF("Polling update URL: http://%s%s", UPDATE_HOST, UPDATE_PATH);
+	LOG_INF("Downloading FOTA URL: %s", url);
 
 	req.method = HTTP_GET;
-	req.url = UPDATE_PATH;
-	req.host = UPDATE_HOST;
+	req.url = parsed.path;
+	req.host = parsed.host;
 	req.protocol = "HTTP/1.1";
 	req.response = update_http_response_cb;
 	req.recv_buf = recv_buf;
@@ -366,11 +484,9 @@ static int poll_update_url_once(void)
 	}
 
 	if (dl_ctx.status_code != 200) {
-		LOG_INF("No update image available (HTTP %d)", dl_ctx.status_code);
-		return 0;
+		LOG_INF("FOTA URL not available (HTTP %d)", dl_ctx.status_code);
+		return -ENOENT;
 	}
-
-	LOG_INF("Update image found (HTTP 200), downloading...");
 
 	if (dl_ctx.download_failed || !dl_ctx.flash_initialized || !dl_ctx.final_received ||
 	    dl_ctx.bytes_written == 0U) {
@@ -398,44 +514,585 @@ static int poll_update_url_once(void)
 	return 0;
 }
 
-static void update_thread_fn(void *arg1, void *arg2, void *arg3)
+static bool mqtt_topic_equals(const struct mqtt_utf8 *topic, const char *expected)
 {
+	size_t expected_len = strlen(expected);
+
+	return topic->size == expected_len && memcmp(topic->utf8, expected, expected_len) == 0;
+}
+
+static uint16_t next_mqtt_message_id(void)
+{
+	mqtt_message_id++;
+	if (mqtt_message_id == 0U) {
+		mqtt_message_id = 1U;
+	}
+
+	return mqtt_message_id;
+}
+
+static void mqtt_prepare_fds(struct mqtt_client *client)
+{
+	if (client->transport.type != MQTT_TRANSPORT_NON_SECURE) {
+		mqtt_nfds = 0;
+		return;
+	}
+
+	mqtt_fds[0].fd = client->transport.tcp.sock;
+	mqtt_fds[0].events = ZSOCK_POLLIN;
+	mqtt_nfds = 1;
+}
+
+static void mqtt_clear_fds(void)
+{
+	mqtt_nfds = 0;
+}
+
+static int mqtt_socket_wait(int timeout_ms)
+{
+	if (mqtt_nfds == 0) {
+		k_sleep(K_MSEC(timeout_ms));
+		return 0;
+	}
+
+	return zsock_poll(mqtt_fds, mqtt_nfds, timeout_ms);
+}
+
+static int mqtt_publish_uptime(void)
+{
+	uint8_t payload[MQTT_DATA_PAYLOAD_BUF_SIZE];
+	struct mqtt_publish_param param = {0};
+	int64_t uptime_sec = k_uptime_get() / MSEC_PER_SEC;
+	size_t encoded_len;
+	bool ok;
+
+	ZCBOR_STATE_E(zse, 2, payload, sizeof(payload), 1);
+
+	ok = zcbor_map_start_encode(zse, 1) &&
+	     zcbor_tstr_put_lit(zse, "uptime") &&
+	     zcbor_int64_put(zse, uptime_sec) &&
+	     zcbor_map_end_encode(zse, 1);
+	if (!ok) {
+		LOG_ERR("Failed to encode uptime CBOR");
+		return -EMSGSIZE;
+	}
+
+	encoded_len = (size_t)(zse->payload - payload);
+
+	param.message.topic.topic.utf8 = (uint8_t *)MQTT_TOPIC_DATA;
+	param.message.topic.topic.size = strlen(MQTT_TOPIC_DATA);
+	param.message.topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
+	param.message.payload.data = payload;
+	param.message.payload.len = encoded_len;
+	param.message_id = next_mqtt_message_id();
+	param.dup_flag = 0U;
+	param.retain_flag = 0U;
+
+	return mqtt_publish(&mqtt_client_ctx, &param);
+}
+
+static int mqtt_subscribe_task_topic(struct mqtt_client *client)
+{
+	struct mqtt_topic topic = {
+		.topic = {
+			.utf8 = (uint8_t *)MQTT_TOPIC_TASK,
+			.size = strlen(MQTT_TOPIC_TASK),
+		},
+		.qos = MQTT_QOS_0_AT_MOST_ONCE,
+	};
+	const struct mqtt_subscription_list sub = {
+		.list = &topic,
+		.list_count = 1U,
+		.message_id = next_mqtt_message_id(),
+	};
+
+	return mqtt_subscribe(client, &sub);
+}
+
+static int mqtt_drain_publish_payload(struct mqtt_client *client, size_t len)
+{
+	uint8_t discard[64];
+	size_t remaining = len;
+
+	while (remaining > 0U) {
+		size_t chunk = MIN(remaining, sizeof(discard));
+		int ret = mqtt_read_publish_payload(client, discard, chunk);
+
+		if (ret < 0) {
+			return ret;
+		}
+		if (ret == 0) {
+			return -EIO;
+		}
+
+		remaining -= (size_t)ret;
+	}
+
+	return 0;
+}
+
+static int mqtt_read_publish_payload_all(struct mqtt_client *client, uint8_t *buf, size_t len)
+{
+	size_t total = 0;
+
+	while (total < len) {
+		size_t chunk = len - total;
+		int ret = mqtt_read_publish_payload(client, buf + total, chunk);
+
+		if (ret < 0) {
+			return ret;
+		}
+		if (ret == 0) {
+			return -EIO;
+		}
+
+		total += (size_t)ret;
+	}
+
+	return (int)total;
+}
+
+static int decode_task_cbor(const uint8_t *payload, size_t payload_len, struct mqtt_task_message *msg)
+{
+	if (payload == NULL || msg == NULL) {
+		return -EINVAL;
+	}
+
+	ZCBOR_STATE_D(zsd, 4, payload, payload_len, 1, 0);
+
+	if (!zcbor_map_start_decode(zsd)) {
+		return -EBADMSG;
+	}
+
+	while (!zcbor_array_at_end(zsd)) {
+		struct zcbor_string key;
+
+		if (!zcbor_tstr_decode(zsd, &key)) {
+			return -EBADMSG;
+		}
+
+		if (key.len == 4U && memcmp(key.value, "task", 4) == 0) {
+			struct zcbor_string task;
+
+			if (!zcbor_tstr_decode(zsd, &task)) {
+				return -EBADMSG;
+			}
+			if (task.len == 0U || task.len >= sizeof(msg->task)) {
+				return -EMSGSIZE;
+			}
+
+			memcpy(msg->task, task.value, task.len);
+			msg->task[task.len] = '\0';
+			msg->has_task = true;
+		} else if (key.len == 5U && memcmp(key.value, "param", 5) == 0) {
+			struct zcbor_string param;
+
+			if (!zcbor_tstr_decode(zsd, &param)) {
+				return -EBADMSG;
+			}
+			if (param.len > FOTA_URL_MAX_LEN) {
+				return -EMSGSIZE;
+			}
+
+			memcpy(msg->param, param.value, param.len);
+			msg->param[param.len] = '\0';
+			msg->has_param = true;
+		} else {
+			if (!zcbor_any_skip(zsd, NULL)) {
+				return -EBADMSG;
+			}
+		}
+	}
+
+	if (!zcbor_map_end_decode(zsd)) {
+		return -EBADMSG;
+	}
+
+	if (!msg->has_task) {
+		return -EBADMSG;
+	}
+
+	return 0;
+}
+
+static void schedule_fota_from_url(const char *url)
+{
+	size_t url_len = strlen(url);
+
+	if (strncmp(url, "http://", strlen("http://")) != 0) {
+		LOG_WRN("Ignoring FOTA task: URL must start with http://");
+		return;
+	}
+
+	if (url_len == 0U || url_len > FOTA_URL_MAX_LEN) {
+		LOG_WRN("Ignoring FOTA task: URL length invalid (%u)", (unsigned int)url_len);
+		return;
+	}
+
+	if (atomic_get(&fota_ongoing) || atomic_get(&fota_pending)) {
+		LOG_WRN("Ignoring FOTA task: update is already ongoing");
+		return;
+	}
+
+	if (atomic_get(&update_pending) || is_upgrade_already_pending()) {
+		LOG_WRN("Ignoring FOTA task: MCUboot swap already pending");
+		return;
+	}
+
+	k_mutex_lock(&fota_url_mutex, K_FOREVER);
+	strcpy(pending_fota_url, url);
+	atomic_set(&fota_pending, 1);
+	k_mutex_unlock(&fota_url_mutex);
+
+	k_sem_give(&fota_request_sem);
+	LOG_INF("FOTA task scheduled: %s", url);
+}
+
+static void handle_mqtt_publish(struct mqtt_client *client, const struct mqtt_publish_param *pub)
+{
+	uint8_t payload[MQTT_TASK_PAYLOAD_BUF_SIZE];
+	size_t payload_len = pub->message.payload.len;
+	struct mqtt_task_message msg = {0};
+	int ret;
+
+	if (!mqtt_topic_equals(&pub->message.topic.topic, MQTT_TOPIC_TASK)) {
+		(void)mqtt_drain_publish_payload(client, payload_len);
+		return;
+	}
+
+	if (payload_len > sizeof(payload)) {
+		LOG_WRN("Task payload too large (%u bytes)", (unsigned int)payload_len);
+		(void)mqtt_drain_publish_payload(client, payload_len);
+		return;
+	}
+
+	ret = mqtt_read_publish_payload_all(client, payload, payload_len);
+	if (ret < 0) {
+		LOG_ERR("Failed to read task payload (%d)", ret);
+		return;
+	}
+
+	ret = decode_task_cbor(payload, payload_len, &msg);
+	if (ret < 0) {
+		LOG_WRN("Failed to decode CBOR task (%d)", ret);
+		return;
+	}
+
+	LOG_INF("MQTT task received: task='%s' param='%s'", msg.task, msg.has_param ? msg.param : "");
+
+	if (strcmp(msg.task, "fota") != 0) {
+		LOG_INF("Unsupported task type '%s'", msg.task);
+		return;
+	}
+
+	if (!msg.has_param || msg.param[0] == '\0') {
+		LOG_WRN("Ignoring FOTA task: missing URL parameter");
+		return;
+	}
+
+	schedule_fota_from_url(msg.param);
+}
+
+static void mqtt_evt_handler(struct mqtt_client *const client, const struct mqtt_evt *evt)
+{
+	switch (evt->type) {
+	case MQTT_EVT_CONNACK:
+		if (evt->result != 0) {
+			LOG_ERR("MQTT connect failed (%d)", evt->result);
+			break;
+		}
+
+		atomic_set(&mqtt_connected, 1);
+		atomic_set(&mqtt_subscribed, 0);
+		LOG_INF("MQTT connected to %s:%d as %s", MQTT_BROKER_ADDR, MQTT_BROKER_PORT,
+			MQTT_CLIENT_ID);
+
+		int sub_ret = mqtt_subscribe_task_topic(client);
+		if (sub_ret < 0) {
+			LOG_ERR("MQTT subscribe failed (%d)", sub_ret);
+		}
+		break;
+
+	case MQTT_EVT_DISCONNECT:
+		LOG_INF("MQTT disconnected (%d)", evt->result);
+		atomic_set(&mqtt_connected, 0);
+		atomic_set(&mqtt_subscribed, 0);
+		mqtt_clear_fds();
+		break;
+
+	case MQTT_EVT_SUBACK:
+		if (evt->result != 0) {
+			LOG_ERR("MQTT SUBACK error (%d)", evt->result);
+			break;
+		}
+		atomic_set(&mqtt_subscribed, 1);
+		LOG_INF("Subscribed to topic %s", MQTT_TOPIC_TASK);
+		break;
+
+	case MQTT_EVT_PUBLISH:
+		if (evt->param.publish.message.topic.qos == MQTT_QOS_1_AT_LEAST_ONCE) {
+			const struct mqtt_puback_param ack = {
+				.message_id = evt->param.publish.message_id,
+			};
+			(void)mqtt_publish_qos1_ack(client, &ack);
+		} else if (evt->param.publish.message.topic.qos == MQTT_QOS_2_EXACTLY_ONCE) {
+			const struct mqtt_pubrec_param rec = {
+				.message_id = evt->param.publish.message_id,
+			};
+			(void)mqtt_publish_qos2_receive(client, &rec);
+		}
+
+		handle_mqtt_publish(client, &evt->param.publish);
+		break;
+
+	case MQTT_EVT_PINGRESP:
+		LOG_DBG("MQTT ping response");
+		break;
+
+	default:
+		break;
+	}
+}
+
+static int mqtt_broker_init(void)
+{
+	struct sockaddr_in *broker4 = (struct sockaddr_in *)&mqtt_broker;
+	int ret;
+
+	memset(&mqtt_broker, 0, sizeof(mqtt_broker));
+	broker4->sin_family = AF_INET;
+	broker4->sin_port = htons(MQTT_BROKER_PORT);
+
+	ret = zsock_inet_pton(AF_INET, MQTT_BROKER_ADDR, &broker4->sin_addr);
+	if (ret != 1) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void mqtt_client_prepare(struct mqtt_client *client)
+{
+	mqtt_client_init(client);
+
+	client->broker = &mqtt_broker;
+	client->evt_cb = mqtt_evt_handler;
+	client->client_id.utf8 = (uint8_t *)MQTT_CLIENT_ID;
+	client->client_id.size = strlen(MQTT_CLIENT_ID);
+	client->password = NULL;
+	client->user_name = NULL;
+	client->protocol_version = MQTT_VERSION_3_1_1;
+	client->transport.type = MQTT_TRANSPORT_NON_SECURE;
+
+	client->rx_buf = mqtt_rx_buffer;
+	client->rx_buf_size = sizeof(mqtt_rx_buffer);
+	client->tx_buf = mqtt_tx_buffer;
+	client->tx_buf_size = sizeof(mqtt_tx_buffer);
+}
+
+static void mqtt_abort_and_reset(void)
+{
+	(void)mqtt_abort(&mqtt_client_ctx);
+	atomic_set(&mqtt_connected, 0);
+	atomic_set(&mqtt_subscribed, 0);
+	mqtt_clear_fds();
+}
+
+static int mqtt_connect_once(void)
+{
+	int ret;
+	int64_t deadline;
+
+	ret = mqtt_broker_init();
+	if (ret < 0) {
+		LOG_ERR("Invalid MQTT broker address (%d)", ret);
+		return ret;
+	}
+
+	mqtt_client_prepare(&mqtt_client_ctx);
+
+	ret = mqtt_connect(&mqtt_client_ctx);
+	if (ret < 0) {
+		LOG_WRN("mqtt_connect failed (%d)", ret);
+		return ret;
+	}
+
+	mqtt_prepare_fds(&mqtt_client_ctx);
+	deadline = k_uptime_get() + MQTT_CONNECT_TIMEOUT_MS;
+
+	while (!atomic_get(&mqtt_connected) && k_uptime_get() < deadline) {
+		int remaining = (int)(deadline - k_uptime_get());
+		int poll_ret = mqtt_socket_wait(MAX(remaining, 0));
+
+		if (poll_ret < 0) {
+			LOG_WRN("MQTT connect poll failed (%d)", poll_ret);
+			mqtt_abort_and_reset();
+			return poll_ret;
+		}
+
+		if (poll_ret > 0) {
+			ret = mqtt_input(&mqtt_client_ctx);
+			if (ret < 0) {
+				LOG_WRN("mqtt_input failed during connect (%d)", ret);
+				mqtt_abort_and_reset();
+				return ret;
+			}
+		}
+	}
+
+	if (!atomic_get(&mqtt_connected)) {
+		LOG_WRN("MQTT connect timeout");
+		mqtt_abort_and_reset();
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+static void mqtt_thread_fn(void *arg1, void *arg2, void *arg3)
+{
+	int64_t next_publish = 0;
+
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
 
 	while (1) {
-		if (atomic_get(&net_ready)) {
-			if (atomic_get(&waiting_for_ipv4_logged)) {
-				atomic_set(&waiting_for_ipv4_logged, 0);
-				LOG_INF("IPv4 became ready, polling/resume conditions met");
+		if (!atomic_get(&net_ready)) {
+			if (!atomic_get(&mqtt_waiting_for_ipv4_logged)) {
+				atomic_set(&mqtt_waiting_for_ipv4_logged, 1);
+				LOG_INF("MQTT paused: waiting for IPv4 assignment");
 			}
 
-			if (!atomic_get(&polling_started)) {
-				atomic_set(&polling_started, 1);
-				LOG_INF("HTTP polling started");
+			if (atomic_get(&mqtt_connected) || mqtt_nfds > 0) {
+				mqtt_abort_and_reset();
 			}
 
-			confirm_running_image_once();
-
-			if (!atomic_get(&update_pending) && !is_upgrade_already_pending()) {
-				int ret = poll_update_url_once();
-
-				if (ret < 0) {
-					LOG_WRN("Update poll failed (%d)", ret);
-				}
-			}
-		} else if (!atomic_get(&waiting_for_ipv4_logged)) {
-			atomic_set(&waiting_for_ipv4_logged, 1);
-			LOG_INF("HTTP polling paused: waiting for IPv4 assignment");
+			k_sleep(K_SECONDS(1));
+			continue;
 		}
 
-		k_sleep(UPDATE_POLL_PERIOD);
+		if (atomic_get(&mqtt_waiting_for_ipv4_logged)) {
+			atomic_set(&mqtt_waiting_for_ipv4_logged, 0);
+			LOG_INF("IPv4 ready, MQTT service active");
+		}
+
+		if (!atomic_get(&mqtt_connected)) {
+			int ret = mqtt_connect_once();
+
+			if (ret < 0) {
+				k_sleep(MQTT_RECONNECT_DELAY);
+				continue;
+			}
+
+			next_publish = k_uptime_get() + MQTT_PUBLISH_PERIOD_MS;
+		}
+
+		int timeout_ms = MQTT_SERVICE_IDLE_SLICE_MS;
+		int keepalive_left = mqtt_keepalive_time_left(&mqtt_client_ctx);
+		int64_t now = k_uptime_get();
+		int64_t to_publish = next_publish - now;
+
+		if (keepalive_left > 0 && keepalive_left < timeout_ms) {
+			timeout_ms = keepalive_left;
+		}
+
+		if (to_publish < timeout_ms) {
+			timeout_ms = MAX(0, (int)to_publish);
+		}
+
+		int poll_ret = mqtt_socket_wait(timeout_ms);
+		if (poll_ret < 0) {
+			LOG_WRN("MQTT socket wait failed (%d)", poll_ret);
+			mqtt_abort_and_reset();
+			k_sleep(MQTT_RECONNECT_DELAY);
+			continue;
+		}
+
+		if (poll_ret > 0 && atomic_get(&mqtt_connected)) {
+			int ret = mqtt_input(&mqtt_client_ctx);
+
+			if (ret < 0) {
+				LOG_WRN("mqtt_input failed (%d)", ret);
+				mqtt_abort_and_reset();
+				k_sleep(MQTT_RECONNECT_DELAY);
+				continue;
+			}
+		}
+
+		if (atomic_get(&mqtt_connected)) {
+			int ret = mqtt_live(&mqtt_client_ctx);
+
+			if (ret != 0 && ret != -EAGAIN) {
+				LOG_WRN("mqtt_live failed (%d)", ret);
+				mqtt_abort_and_reset();
+				k_sleep(MQTT_RECONNECT_DELAY);
+				continue;
+			}
+		}
+
+		now = k_uptime_get();
+		if (atomic_get(&mqtt_connected) && now >= next_publish) {
+			int ret = mqtt_publish_uptime();
+
+			if (ret < 0) {
+				LOG_WRN("Failed to publish uptime (%d)", ret);
+			}
+
+			next_publish = now + MQTT_PUBLISH_PERIOD_MS;
+		}
 	}
 }
 
-K_THREAD_DEFINE(update_thread, UPDATE_THREAD_STACK_SIZE, update_thread_fn, NULL, NULL, NULL,
-		UPDATE_THREAD_PRIORITY, 0, 0);
+static void fota_thread_fn(void *arg1, void *arg2, void *arg3)
+{
+	char url[FOTA_URL_MAX_LEN + 1];
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	while (1) {
+		k_sem_take(&fota_request_sem, K_FOREVER);
+
+		if (!atomic_cas(&fota_pending, 1, 0)) {
+			continue;
+		}
+
+		if (!atomic_get(&net_ready)) {
+			LOG_WRN("Ignoring queued FOTA task: network is not ready");
+			continue;
+		}
+
+		if (atomic_get(&fota_ongoing)) {
+			LOG_WRN("Ignoring queued FOTA task: update is already running");
+			continue;
+		}
+
+		if (atomic_get(&update_pending) || is_upgrade_already_pending()) {
+			LOG_WRN("Ignoring queued FOTA task: MCUboot swap already pending");
+			continue;
+		}
+
+		k_mutex_lock(&fota_url_mutex, K_FOREVER);
+		strcpy(url, pending_fota_url);
+		k_mutex_unlock(&fota_url_mutex);
+
+		atomic_set(&fota_ongoing, 1);
+		int ret = download_update_from_url(url);
+
+		if (ret < 0) {
+			LOG_ERR("FOTA from '%s' failed (%d)", url, ret);
+		}
+
+		atomic_set(&fota_ongoing, 0);
+	}
+}
+
+K_THREAD_DEFINE(mqtt_thread, MQTT_THREAD_STACK_SIZE, mqtt_thread_fn, NULL, NULL, NULL,
+		MQTT_THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(fota_thread, FOTA_THREAD_STACK_SIZE, fota_thread_fn, NULL, NULL, NULL,
+		FOTA_THREAD_PRIORITY, 0, 0);
 
 static void on_net_event(struct net_mgmt_event_callback *cb, uint64_t event, struct net_if *iface)
 {
@@ -492,8 +1149,11 @@ int main(void)
 	target_iface = net_if_get_default();
 	atomic_set(&net_ready, 0);
 	atomic_set(&update_pending, 0);
-	atomic_set(&polling_started, 0);
-	atomic_set(&waiting_for_ipv4_logged, 0);
+	atomic_set(&mqtt_connected, 0);
+	atomic_set(&mqtt_subscribed, 0);
+	atomic_set(&mqtt_waiting_for_ipv4_logged, 0);
+	atomic_set(&fota_pending, 0);
+	atomic_set(&fota_ongoing, 0);
 
 	if (IS_ENABLED(CONFIG_BOOTLOADER_MCUBOOT)) {
 		bool confirmed = boot_is_img_confirmed();
