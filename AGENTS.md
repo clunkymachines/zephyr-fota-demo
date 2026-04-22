@@ -17,6 +17,6 @@ The application will:
     - subscribe to the topic "device/demo001/task", decode the CBOR message '{"task": [type of the task], "param" : [ a 256 bytes string] }' and log it
     - if the task is "fota", then use the param as an http url and try to download the binary image and flash the update partition
     - publish every 5 second using QOS0 on the topic "device/demo001/data" a CBOR message with the equivalent of the json representation '{"uptime":[uptime in seconds]}'
- - the url will be http://vrm.free.fr/demo.bin
- - the URL is checked every 10 seconds, if it's 200, then download the file and write it in the second partition
+    - the task fota will publish download progress in % for each retrieved block in the "device/demo001/data" with {"download":[percent]}
+    - once the fota task is done or failed it will publish in the "device/demo001/data" {"task":"fota", "result":["OK" or "KO"], "error":[error message in case of failure]}
  - on boot if the device sucesfully get a IPv4 address mark the partition as 'tested'

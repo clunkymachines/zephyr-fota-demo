@@ -7,6 +7,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/net/socket.h>
@@ -27,7 +28,7 @@
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define LED0_NODE DT_ALIAS(led0)
-#define BLINK_PERIOD K_MSEC(100)
+#define BLINK_PERIOD K_MSEC(2000)
 
 #define FOTA_THREAD_STACK_SIZE 4096
 #define FOTA_THREAD_PRIORITY 7
@@ -46,6 +47,10 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define MQTT_PUBLISH_PERIOD_MS 5000
 #define MQTT_TASK_PAYLOAD_BUF_SIZE 320
 #define MQTT_DATA_PAYLOAD_BUF_SIZE 64
+#define MQTT_EVENT_PAYLOAD_BUF_SIZE 196
+#define MQTT_EVENT_QUEUE_LEN 16
+#define MQTT_EVENT_ERROR_LEN 96
+#define MQTT_EVENT_BURST_MAX 4
 
 #define FOTA_URL_MAX_LEN 256
 #define HTTP_DEFAULT_PORT "80"
@@ -89,12 +94,15 @@ static char pending_fota_url[FOTA_URL_MAX_LEN + 1];
 struct update_download_context {
 	struct flash_img_context flash_ctx;
 	size_t bytes_written;
+	size_t content_length;
 	int status_code;
+	int last_reported_percent;
 	uint8_t upload_slot;
 	bool status_seen;
 	bool flash_initialized;
 	bool download_failed;
 	bool final_received;
+	bool progress_enabled;
 };
 
 struct parsed_http_url {
@@ -109,6 +117,23 @@ struct mqtt_task_message {
 	bool has_task;
 	bool has_param;
 };
+
+enum app_mqtt_event_type {
+	APP_MQTT_EVENT_FOTA_PROGRESS = 1,
+	APP_MQTT_EVENT_FOTA_RESULT = 2,
+};
+
+struct app_mqtt_event {
+	uint8_t type;
+	uint8_t progress_percent;
+	bool result_ok;
+	char error[MQTT_EVENT_ERROR_LEN];
+};
+
+K_MSGQ_DEFINE(app_mqtt_event_msgq, sizeof(struct app_mqtt_event), MQTT_EVENT_QUEUE_LEN, 4);
+
+static void enqueue_fota_progress_event(uint8_t percent);
+static void enqueue_fota_result_event(bool ok, const char *error_msg);
 
 static bool is_target_iface(struct net_if *iface)
 {
@@ -294,6 +319,11 @@ static int update_http_response_cb(struct http_response *rsp, enum http_final_ca
 	if (!ctx->status_seen) {
 		ctx->status_seen = true;
 		ctx->status_code = rsp->http_status_code;
+		ctx->last_reported_percent = -1;
+		ctx->progress_enabled = rsp->cl_present && (rsp->content_length > 0U);
+		if (ctx->progress_enabled) {
+			ctx->content_length = rsp->content_length;
+		}
 	}
 
 	status_code = ctx->status_seen ? ctx->status_code : rsp->http_status_code;
@@ -343,6 +373,18 @@ static int update_http_response_cb(struct http_response *rsp, enum http_final_ca
 
 	ctx->bytes_written = flash_img_bytes_written(&ctx->flash_ctx);
 	LOG_DBG("Downloaded %u bytes so far", (unsigned int)ctx->bytes_written);
+
+	if (ctx->progress_enabled) {
+		size_t processed = MIN(rsp->processed, ctx->content_length);
+		int percent = (int)((processed * 100U) / ctx->content_length);
+
+		percent = CLAMP(percent, 0, 100);
+		if (percent != ctx->last_reported_percent) {
+			ctx->last_reported_percent = percent;
+			enqueue_fota_progress_event((uint8_t)percent);
+		}
+	}
+
 	if (is_final) {
 		ctx->final_received = true;
 	}
@@ -443,6 +485,7 @@ static int download_update_from_url(const char *url)
 		NULL,
 	};
 	uint8_t recv_buf[UPDATE_RECV_BUF_SIZE];
+	char error_msg[MQTT_EVENT_ERROR_LEN];
 	struct parsed_http_url parsed = {0};
 	struct update_download_context dl_ctx = {0};
 	struct http_request req = {0};
@@ -452,11 +495,15 @@ static int download_update_from_url(const char *url)
 	ret = parse_http_url(url, &parsed);
 	if (ret < 0) {
 		LOG_ERR("Invalid FOTA URL: %s", url);
+		snprintk(error_msg, sizeof(error_msg), "invalid url (%d)", ret);
+		enqueue_fota_result_event(false, error_msg);
 		return ret;
 	}
 
 	sock = connect_http_socket(parsed.host, parsed.port);
 	if (sock < 0) {
+		snprintk(error_msg, sizeof(error_msg), "socket/connect failed (%d)", sock);
+		enqueue_fota_result_event(false, error_msg);
 		return sock;
 	}
 
@@ -475,37 +522,48 @@ static int download_update_from_url(const char *url)
 	zsock_close(sock);
 	if (ret < 0) {
 		LOG_WRN("HTTP request failed (%d)", ret);
+		snprintk(error_msg, sizeof(error_msg), "http request failed (%d)", ret);
+		enqueue_fota_result_event(false, error_msg);
 		return ret;
 	}
 
 	if (!dl_ctx.status_seen) {
 		LOG_WRN("HTTP response status not parsed");
+		enqueue_fota_result_event(false, "http status missing");
 		return -EBADMSG;
 	}
 
 	if (dl_ctx.status_code != 200) {
 		LOG_INF("FOTA URL not available (HTTP %d)", dl_ctx.status_code);
+		snprintk(error_msg, sizeof(error_msg), "http status %u", dl_ctx.status_code);
+		enqueue_fota_result_event(false, error_msg);
 		return -ENOENT;
 	}
 
 	if (dl_ctx.download_failed || !dl_ctx.flash_initialized || !dl_ctx.final_received ||
 	    dl_ctx.bytes_written == 0U) {
 		LOG_ERR("Update download incomplete");
+		enqueue_fota_result_event(false, "download incomplete");
 		return -EIO;
 	}
 
 	if (!IS_ENABLED(CONFIG_BOOTLOADER_MCUBOOT)) {
 		LOG_ERR("MCUboot support is not enabled");
+		enqueue_fota_result_event(false, "mcuboot support disabled");
 		return -ENOTSUP;
 	}
 
 	ret = boot_request_upgrade(BOOT_UPGRADE_TEST);
 	if (ret < 0) {
 		LOG_ERR("boot_request_upgrade failed (%d)", ret);
+		snprintk(error_msg, sizeof(error_msg), "boot_request_upgrade failed (%d)", ret);
+		enqueue_fota_result_event(false, error_msg);
 		return ret;
 	}
 
 	atomic_set(&update_pending, 1);
+	enqueue_fota_result_event(true, NULL);
+	k_sleep(K_MSEC(1200));
 	LOG_INF("Update written (%u bytes) to slot %u; rebooting for MCUboot swap",
 		(unsigned int)dl_ctx.bytes_written, dl_ctx.upload_slot);
 	log_panic();
@@ -558,10 +616,25 @@ static int mqtt_socket_wait(int timeout_ms)
 	return zsock_poll(mqtt_fds, mqtt_nfds, timeout_ms);
 }
 
+static int mqtt_publish_data_payload(const uint8_t *payload, size_t payload_len)
+{
+	struct mqtt_publish_param param = {0};
+
+	param.message.topic.topic.utf8 = (uint8_t *)MQTT_TOPIC_DATA;
+	param.message.topic.topic.size = strlen(MQTT_TOPIC_DATA);
+	param.message.topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
+	param.message.payload.data = (uint8_t *)payload;
+	param.message.payload.len = payload_len;
+	param.message_id = next_mqtt_message_id();
+	param.dup_flag = 0U;
+	param.retain_flag = 0U;
+
+	return mqtt_publish(&mqtt_client_ctx, &param);
+}
+
 static int mqtt_publish_uptime(void)
 {
 	uint8_t payload[MQTT_DATA_PAYLOAD_BUF_SIZE];
-	struct mqtt_publish_param param = {0};
 	int64_t uptime_sec = k_uptime_get() / MSEC_PER_SEC;
 	size_t encoded_len;
 	bool ok;
@@ -578,17 +651,107 @@ static int mqtt_publish_uptime(void)
 	}
 
 	encoded_len = (size_t)(zse->payload - payload);
+	return mqtt_publish_data_payload(payload, encoded_len);
+}
 
-	param.message.topic.topic.utf8 = (uint8_t *)MQTT_TOPIC_DATA;
-	param.message.topic.topic.size = strlen(MQTT_TOPIC_DATA);
-	param.message.topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
-	param.message.payload.data = payload;
-	param.message.payload.len = encoded_len;
-	param.message_id = next_mqtt_message_id();
-	param.dup_flag = 0U;
-	param.retain_flag = 0U;
+static void enqueue_fota_progress_event(uint8_t percent)
+{
+	struct app_mqtt_event event = {
+		.type = APP_MQTT_EVENT_FOTA_PROGRESS,
+		.progress_percent = percent,
+	};
 
-	return mqtt_publish(&mqtt_client_ctx, &param);
+	if (k_msgq_put(&app_mqtt_event_msgq, &event, K_NO_WAIT) != 0) {
+		LOG_WRN("Dropping FOTA progress event (queue full)");
+	}
+}
+
+static void enqueue_fota_result_event(bool ok, const char *error_msg)
+{
+	struct app_mqtt_event event = {
+		.type = APP_MQTT_EVENT_FOTA_RESULT,
+		.result_ok = ok,
+	};
+
+	if (!ok && error_msg != NULL && error_msg[0] != '\0') {
+		snprintk(event.error, sizeof(event.error), "%s", error_msg);
+	}
+
+	if (k_msgq_put(&app_mqtt_event_msgq, &event, K_NO_WAIT) != 0) {
+		LOG_WRN("Dropping FOTA result event (queue full)");
+	}
+}
+
+static int mqtt_publish_fota_event(const struct app_mqtt_event *event)
+{
+	uint8_t payload[MQTT_EVENT_PAYLOAD_BUF_SIZE];
+
+	if (event->type == APP_MQTT_EVENT_FOTA_PROGRESS) {
+		uint32_t pct = event->progress_percent;
+		size_t encoded_len;
+		bool ok;
+
+		ZCBOR_STATE_E(zse, 2, payload, sizeof(payload), 1);
+		ok = zcbor_map_start_encode(zse, 1) &&
+		     zcbor_tstr_put_lit(zse, "download") &&
+		     zcbor_uint32_put(zse, pct) &&
+		     zcbor_map_end_encode(zse, 1);
+		if (!ok) {
+			return -EMSGSIZE;
+		}
+
+		encoded_len = (size_t)(zse->payload - payload);
+		return mqtt_publish_data_payload(payload, encoded_len);
+	} else if (event->type == APP_MQTT_EVENT_FOTA_RESULT) {
+		bool has_error = (!event->result_ok && event->error[0] != '\0');
+		size_t field_count = has_error ? 3U : 2U;
+		size_t encoded_len;
+		bool ok;
+
+		ZCBOR_STATE_E(zse, 2, payload, sizeof(payload), 1);
+		ok = zcbor_map_start_encode(zse, field_count) &&
+		     zcbor_tstr_put_lit(zse, "task") &&
+		     zcbor_tstr_put_lit(zse, "fota") &&
+		     zcbor_tstr_put_lit(zse, "result") &&
+		     zcbor_tstr_encode_ptr(zse, event->result_ok ? "OK" : "KO", 2);
+
+		if (ok && has_error) {
+			ok = zcbor_tstr_put_lit(zse, "error") &&
+			     zcbor_tstr_encode_ptr(zse, event->error, strlen(event->error));
+		}
+
+		ok = ok && zcbor_map_end_encode(zse, field_count);
+		if (!ok) {
+			return -EMSGSIZE;
+		}
+
+		encoded_len = (size_t)(zse->payload - payload);
+		return mqtt_publish_data_payload(payload, encoded_len);
+	} else {
+		return -EINVAL;
+	}
+}
+
+static void mqtt_publish_pending_events(void)
+{
+	struct app_mqtt_event event;
+
+	for (int i = 0; i < MQTT_EVENT_BURST_MAX; i++) {
+		if (!atomic_get(&mqtt_connected)) {
+			return;
+		}
+
+		if (k_msgq_get(&app_mqtt_event_msgq, &event, K_NO_WAIT) != 0) {
+			return;
+		}
+
+		int ret = mqtt_publish_fota_event(&event);
+
+		if (ret < 0) {
+			LOG_WRN("Failed to publish queued FOTA event (%d)", ret);
+			return;
+		}
+	}
 }
 
 static int mqtt_subscribe_task_topic(struct mqtt_client *client)
@@ -1030,6 +1193,8 @@ static void mqtt_thread_fn(void *arg1, void *arg2, void *arg3)
 				continue;
 			}
 		}
+
+		mqtt_publish_pending_events();
 
 		now = k_uptime_get();
 		if (atomic_get(&mqtt_connected) && now >= next_publish) {
